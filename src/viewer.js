@@ -1,4 +1,6 @@
+
 import {
+    Asset,
     BoundingBox,
     Color,
     FlyController,
@@ -13,6 +15,7 @@ import { AnimController } from './controllers/anim-controller.js';
 import { easeOut } from './core/math.js';
 import { AppController } from './input.js';
 import { Picker } from './picker.js';
+import { chunkCompressedPly } from './chunker.js'; // added for runtime tiling
 
 /** @import { InputController } from 'playcanvas' */
 
@@ -143,7 +146,7 @@ class Viewer {
     }
 
     // initialize the viewer once gsplat asset is finished loading (so we know its bound etc)
-    initialize() {
+    async initialize() {
         const { app, entity, events, state, settings } = this;
 
         // get the gsplat
@@ -380,31 +383,84 @@ class Viewer {
             }
         });
 
-        // initialize the camera entity to initial position and kick off the
-        // first scene sort (which usually happens during render)
+        // -------- load & chunk model -------------------------------------
+        const tiles = await chunkCompressedPly('./assets/model.splat.compressed.ply', 40000);
+        const tileEntities = [];
+
+        // create assets / entities
+        tiles.forEach((t, i) => {
+            const a = new Asset(`tile-${i}`, 'gsplat', { url: '' }, { buffer: t.buffer });
+            app.assets.add(a);
+            a.once('load', () => {
+                const e = new entity();
+                e.addComponent('gsplat', { asset: a });
+                // @ts-ignore custom cache field
+                e._bbox = t.bbox;
+                app.root.addChild(e);
+                tileEntities.push(e);
+            });
+            app.assets.load(a);
+        });
+
+        // budgeted resort driver
+        const MAX_TILES_PER_FRAME = 6;
+        let frameId = 0;
+        app.on('framerender', () => {
+            if (!app.xr.active) return;
+            const camPos = entity.getPosition();
+            const camDir = entity.forward;
+
+            tileEntities.forEach(te => {
+                // @ts-ignore custom '_bbox'
+                const bb = te._bbox;
+                const d = Math.hypot(
+                    bb.min[0] - camPos.x,
+                    bb.min[1] - camPos.y,
+                    bb.min[2] - camPos.z);
+                // @ts-ignore custom field
+                te._pri = 1e5 / (d * d + 1) + ((frameId - (te._last || 0)) * 0.2);
+            });
+            tileEntities.sort((a, b) => {
+                // @ts-ignore
+                return b._pri - a._pri;
+            });
+
+            let spent = 0;
+            for (const te of tileEntities) {
+                const srt = te.gsplat.sorter;
+                if (!srt.busy && spent < MAX_TILES_PER_FRAME) {
+                    srt.setCamera(camPos, camDir);
+                    // @ts-ignore
+                    te._last = frameId; spent++;
+                }
+            }
+            frameId++;
+        });
+
+        // position camera
         entity.setPosition(activePose.position);
         entity.setEulerAngles(activePose.angles);
-        gsplat?.instance?.sort(entity);
 
-        // handle gsplat sort updates
-        gsplat?.instance?.sorter?.on('updated', () => {
-            // request frame render when sorting changes
-            app.renderNextFrame = true;
+        // 'updated' event for each tile – any one triggers a frame render
+        app.once('assets:load:end', () => {
+            tileEntities.forEach(te =>
+                te.gsplat.sorter.on('updated', () => app.renderNextFrame = true));
+        });
 
-            if (!state.readyToRender) {
-                // we're ready to render once the first sort has completed
-                state.readyToRender = true;
+        // request frame render when ready
+        app.renderNextFrame = true;
 
-                // wait for the first valid frame to complete rendering
-                const frameHandle = app.on('frameend', () => {
-                    frameHandle.off();
+        // we're ready to render once the first sort has completed
+        state.readyToRender = true;
 
-                    events.fire('firstFrame');
+        // wait for the first valid frame to complete rendering
+        const frameHandle = app.on('frameend', () => {
+            frameHandle.off();
 
-                    // emit first frame event on window
-                    window.firstFrame?.();
-                });
-            }
+            events.fire('firstFrame');
+
+            // emit first frame event on window
+            window.firstFrame?.();
         });
     }
 }
