@@ -301,9 +301,9 @@ class Viewer {
         app.on('update', (deltaTime) => {
 
             // in xr mode we leave the camera alone
-            if (app.xr.active) {
-                return;
-            }
+            // if (app.xr.active) {
+            //     return;
+            // }
 
             // update input controller
             controller.update(deltaTime, state.cameraMode, activePose.distance);
