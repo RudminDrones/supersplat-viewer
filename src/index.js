@@ -1,8 +1,9 @@
 import '@playcanvas/web-components';
-import { Asset, Color, Entity, EventHandler, MiniStats, Quat, ShaderChunks, Vec3 } from 'playcanvas';
+import { Asset, Color, Entity, EventHandler, MiniStats, Quat, ShaderChunks, Vec3, GSplatInstance } from 'playcanvas';
 import { XrControllers } from 'playcanvas/scripts/esm/xr-controllers.mjs';
 import { XrNavigation } from 'playcanvas/scripts/esm/xr-navigation.mjs';
 
+import { chunkCompressedPly } from './chunk-compressed-ply.js';
 import { migrateSettings } from './data-migrations.js';
 import { observe } from './observe.js';
 import { Viewer } from './viewer.js';
@@ -36,6 +37,7 @@ const pickDepthWgsl = /* wgsl */ `
 const v = new Vec3();
 
 // get experience parameters
+const tiles = [];
 const params = window.sse?.params ?? {};
 
 // displays a blurry poster image which resolves to sharp during loading
@@ -137,11 +139,26 @@ const loadContent = (app) => {
         contents
     });
 
-    asset.on('load', () => {
-        const entity = new Entity('gsplat');
-        entity.setLocalEulerAngles(0, 0, 180);
-        entity.addComponent('gsplat', { asset });
-        app.root.addChild(entity);
+    asset.on('load', async () => {
+        const mono = new Entity('gsplat-mono');
+        mono.setLocalEulerAngles(0, 0, 180);
+        mono.addComponent('gsplat', { asset });
+        app.root.addChild(mono);
+
+        mono.enabled = false;
+        const tiles = await chunkCompressedPly(asset.resource, app.graphicsDevice);
+
+        tiles.forEach(({ resource, bbox }, i) => {
+            const e = new Entity(`tile-${i}`);
+            e.addComponent('gsplat');
+            e.gsplat.instance = new GSplatInstance(resource);
+            e._bbox = bbox;
+            app.root.addChild(e);
+            e.gsplat.instance.sort(mono);
+            e.gsplat.instance.sorter.on('updated', () => {
+                app.renderNextFrame = true;
+            });
+        });
     });
 
     asset.on('error', (err) => {
@@ -247,6 +264,27 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     // Wait for gsplat asset to load before initializing the viewer
     waitForGsplat(app, state).then(() => viewer.initialize());
+
+    // budgeted tile sort when in XR
+    const MAX_TILES = 6;
+    let frameId = 0;
+    app.on('framerender', () => {
+        if (!app.xr.active) return;
+        const camPos = camera.getPosition();
+        tiles.forEach((t) => {
+            const d = t._bbox.center.distance(camPos);
+            t._pri = 1e5 / (d * d + 1) + (frameId - (t._last || 0)) * 1e-3;
+        });
+        tiles.sort((a, b) => b._pri - a._pri);
+        let count = 0;
+        for (const t of tiles) {
+            if (count >= MAX_TILES) break;
+            t.gsplat.instance.sort(camera);
+            t._last = frameId;
+            count++;
+        }
+        frameId++;
+    });
 
     // Acquire Elements
     const docRoot = document.documentElement;
